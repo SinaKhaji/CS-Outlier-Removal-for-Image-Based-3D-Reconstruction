@@ -1,31 +1,79 @@
-import pycolmap
 import numpy as np
 import open3d as o3d
 
-def load_views(mvs, kind="photometric"):
-    rec = pycolmap.Reconstruction(mvs + "/sparse")
+def view(samples):
+    windows = []
+    for name, m in samples.items():
+        w = o3d.visualization.Visualizer()
+        w.create_window(window_name=name)
+        w.add_geometry(m)
+        windows.append(w)
+    while all(w.poll_events() for w in windows):
+        for w in windows:
+            w.update_renderer()
+
+def load_bunny(dir):
+    mesh = o3d.io.read_triangle_mesh(o3d.data.BunnyMesh(data_root=dir).path)
+    return mesh
+
+def texture(P):
+    return (127.5 + 127.5 * np.sin(P * [40, 55, 70] + [0, 2, 4])).astype(np.uint8)
+
+def render_views(mesh, n_views=200, dist=1.0, W=640, H=480, f=525.0, outliers=0.05, seed=0):
+    rng = np.random.default_rng(seed)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    K = np.array([f, f, (W - 1) / 2, (H - 1) / 2], np.float32)
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    rays_cam = np.stack([(u - K[2]) / f, (v - K[3]) / f, np.ones((H, W))], -1).reshape(-1, 3)
     views = []
-    for img in sorted(rec.images.values(), key=lambda im: im.name):
-        cam  = rec.cameras[img.camera_id]
-        pose = img.cam_from_world()                                 # world -> camera
-
-        depth = pycolmap.DepthMap()
-        depth.read(mvs + "/stereo/depth_maps/" + f"{img.name}.{kind}.bin")
-        D = depth.to_array()
-
-        views.append(dict(
-            name = img.name,
-            R    = pose.rotation.matrix().astype(np.float32),
-            t    = pose.translation.astype(np.float32),
-            axis = img.viewing_direction(),
-            K    = np.array([cam.focal_length_x, cam.focal_length_y,
-                             cam.principal_point_x, cam.principal_point_y], np.float32),
-            H    = D.shape[0],
-            W    = D.shape[1],
-            D    = D,
-            col  = pycolmap.Bitmap.read(mvs + "/images/" + img.name, as_rgb=True).to_array(),
-        ))
+    for k in range(n_views):
+        az, el = 2 * np.pi * k / (n_views / 4), np.deg2rad([-20, 0, 20, 40][k % 4])
+        C = dist * np.array([np.cos(el) * np.cos(az), np.sin(el), np.cos(el) * np.sin(az)])
+        z = -C / np.linalg.norm(C)                                   # look at the origin, y is up
+        x = np.cross(z, [0, 1, 0]); x /= np.linalg.norm(x)
+        R = np.stack([x, np.cross(z, x), z])                         # world -> camera
+        rays = np.hstack([np.tile(C, (W * H, 1)), rays_cam @ R]).astype(np.float32)
+        D = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy().reshape(H, W)   # z-depth (ray z = 1)
+        D[~np.isfinite(D)] = 0
+        m = D > 0
+        col = np.zeros((H, W, 3), np.uint8)
+        col[m] = texture(C + D[m, None] * (rays_cam @ R).reshape(H, W, 3)[m])     # true surface colour
+        D[m] += rng.normal(0, 0.0012 + 0.0019 * (D[m] - 0.4) ** 2)   # Kinect noise (Nguyen et al. 2012)
+        out = m & (rng.random((H, W)) < outliers)
+        D[out] = rng.uniform(D[m].min(), D[m].max(), out.sum())      # outliers
+        views.append(dict(name=f"view_{k:03d}", R=R.astype(np.float32), t=(-R @ C).astype(np.float32),
+                          axis=R[2], K=K, H=H, W=W, D=D.astype(np.float32), col=col))
     return views
+
+def load_views(scene, n_views=200):
+    K = np.array([517.3, 516.5, 318.6, 255.3], np.float32)          # fr1 colour intrinsics (TUM)
+    depth = np.loadtxt(scene + "/depth.txt", dtype=str)             # timestamp, file   ('#' lines skipped)
+    rgb   = np.loadtxt(scene + "/rgb.txt", dtype=str)               # timestamp, file
+    gt    = np.loadtxt(scene + "/groundtruth.txt")                  # timestamp tx ty tz qx qy qz qw
+    t_d, t_c = depth[:, 0].astype(float), rgb[:, 0].astype(float)
+    views = []
+    for i in np.linspace(0, len(depth) - 1, n_views).astype(int):   # n_views evenly spread frames
+        c = np.abs(t_c - t_d[i]).argmin()                           # closest colour image
+        g = np.abs(gt[:, 0] - t_d[i]).argmin()                      # closest pose
+        tx, ty, tz, qx, qy, qz, qw = gt[g, 1:]
+        R = o3d.geometry.get_rotation_matrix_from_quaternion([qw, qx, qy, qz]).T   # world -> camera
+        t = -R @ np.array([tx, ty, tz])
+        D = np.asarray(o3d.io.read_image(scene + "/" + depth[i, 1]), np.float32) / 5000  # metres
+        col = np.asarray(o3d.io.read_image(scene + "/" + rgb[c, 1]))[..., :3]
+        views.append(dict(name=depth[i, 1], R=R.astype(np.float32), t=t.astype(np.float32), axis=R[2],
+                          K=K, H=D.shape[0], W=D.shape[1], D=D, col=col))
+    return views
+
+def save_all_points(V, path):
+    pts, nrm, cols = [], [], []
+    for Vi in V:
+        prepare_view(Vi, 7, 1.0)
+        m = Vi["valid"].ravel()
+        pts.append((Vi["X"].reshape(-1, 3)[m] - Vi["t"]) @ Vi["R"])
+        nrm.append(Vi["N"].reshape(-1, 3)[m] @ Vi["R"])
+        cols.append(Vi["col"].reshape(-1, 3)[m])
+    save_cloud(path, np.concatenate(pts), np.concatenate(nrm), np.concatenate(cols))
 
 def poisson(src, dst, depth):
     pcd = o3d.io.read_point_cloud(src)
@@ -33,24 +81,11 @@ def poisson(src, dst, depth):
     o3d.io.write_triangle_mesh(dst, mesh)
     return mesh
 
-def view(*meshes):
-    windows = []
-    for m in meshes:
-        m.compute_vertex_normals()
-        w = o3d.visualization.Visualizer()
-        w.create_window()
-        w.add_geometry(m)
-        windows.append(w)
-    while all(w.poll_events() for w in windows):
-        for w in windows:
-            w.update_renderer()
-
 def save_cloud(path, points, normals, colors):
     pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points.astype(np.float64)))
     pcd.normals = o3d.utility.Vector3dVector(normals.astype(np.float64))
     pcd.colors  = o3d.utility.Vector3dVector(colors / 255.0)
     o3d.io.write_point_cloud(path, pcd)
-
 
 # --------------------------------------------------------------------------- #
 # Filter: Wolff et al., 3DV 2016 (supplement, Algorithm 1)
